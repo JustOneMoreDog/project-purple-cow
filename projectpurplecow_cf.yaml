@@ -1,0 +1,178 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation sample template that contains a single Lambda function
+  behind an API Gateway
+Resources:
+  # Lambda function that will get the SSL status of a given website
+  SSLCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        # We are doing this inline for simplicity
+        # However, if we want this to scale (and be easier to manage), we should use S3
+        ZipFile: |
+          import json
+          from datetime import datetime
+          import ssl
+          import socket
+          import re
+          
+          def lambda_handler(event, context):
+              if 'url' not in event:
+                  return {}
+              else:
+                  url = event['url']
+                  if re.search(r'^http[s]?:\/\/', url):
+                      url = re.split(r'^http[s]?:\/\/', url)[1] 
+                  context = ssl.create_default_context()
+                  context.check_hostname = False
+                  conn = context.wrap_socket(socket.socket(socket.AF_INET),server_hostname=url)
+                  conn.settimeout(2.0)
+                  ssl_info = None
+                  try:
+                      conn.connect((url, 443))
+                      ssl_info = conn.getpeercert()
+                  except socket.gaierror as e:
+                      return {
+                          'statusCode': 400,
+                          'body': 'Invalid URL: %s' % url
+                      }
+                  expired = False
+                  if datetime.strptime(ssl_info['notAfter'], r'%b %d %H:%M:%S %Y %Z') <= datetime.today():
+                      expired = True
+                  return {
+                      'hostname': url,
+                      'validFrom': str(datetime.strptime(ssl_info['notBefore'], r'%b %d %H:%M:%S %Y %Z')),
+                      'validTo': str(datetime.strptime(ssl_info['notAfter'], r'%b %d %H:%M:%S %Y %Z')),
+                      'expired': expired
+                  }    
+      Description: Lambda function that takes in a URL and outputs its SSL data
+      FunctionName: SSLCheckLambda
+      # By default the file will be called index.py
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.8
+  # IAM role that will allow the above function to execute
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  # Now that we have our function we will need to make the API for it
+  PurpleCowAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Project Purple Cow API
+      Description: API used for SSL checks
+      FailOnWarnings: true
+  # Now we give our API permissions to execute the above function
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName:
+        # Need to dive deeper here
+        Fn::GetAtt:
+        - SSLCheckLambda
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Join:
+        - ''
+        - - 'arn:aws:execute-api:'
+          - Ref: AWS::Region
+          - ":"
+          - Ref: AWS::AccountId
+          - ":"
+          - Ref: PurpleCowAPI
+          - "/*"
+  # Creating our stage (<--- need better way to describe this)
+  PurpleCowAPIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId:
+        Ref: ApiDeployment
+      RestApiId:
+        Ref: PurpleCowAPI
+      # Not doing v1 yet
+      StageName: v01
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - PurpleCowRequest
+    Properties:
+      RestApiId:
+        Ref: PurpleCowAPI
+      StageName: FooBarStage
+  PurpleCowResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: PurpleCowAPI
+      ParentId:
+        Fn::GetAtt:
+        - PurpleCowAPI
+        - RootResourceId
+      PathPart: ssl-check
+  PurpleCowRequest:
+    DependsOn: LambdaPermission
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      # Calling our function when we get a request
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Join:
+          - ''
+          - - 'arn:aws:apigateway:'
+            - Ref: AWS::Region
+            - ":lambda:path/2015-03-31/functions/"
+            - Fn::GetAtt:
+              - SSLCheckLambda
+              - Arn
+            - "/invocations"
+        IntegrationResponses:
+        - StatusCode: 200
+        RequestTemplates:
+          application/json:
+            # This feels sloppy
+            Fn::Join:
+            - ''
+            - - "{"
+              - '  "url": "$input.params(''url'')"'
+              - "}"
+      RequestParameters:
+        method.request.querystring.name: false
+      ResourceId:
+        Ref: PurpleCowResource
+      RestApiId:
+        Ref: PurpleCowAPI
+      MethodResponses:
+      - StatusCode: 200
+# Output is the root url so user can quickly invoke their api (ie from a script)
+Outputs:
+  RootUrl:
+    Description: Root URL of the API gateway
+    Value:
+      Fn::Join:
+      - ''
+      - - https://
+        - Ref: PurpleCowAPI
+        - ".execute-api."
+        - Ref: AWS::Region
+        - ".amazonaws.com"
